@@ -1,15 +1,15 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.ndimage import gaussian_filter, convolve
-from scipy.special import gamma, factorial
 from PIL import Image
 import cv2
-import os
+from scipy.ndimage import gaussian_filter, convolve
+from scipy.special import gamma, factorial
 
-def load_image(path):
-    img = Image.open(path).convert('RGB')
+def load_image(image_path):
+    img = Image.open(image_path).convert('RGB')
     img = np.asarray(img) / 255.0
-    return np.dot(img[..., :3], [0.2989, 0.5870, 0.1140])
+    img_gray = np.dot(img[..., :3], [0.2989, 0.5870, 0.1140])
+    Image.fromarray((img_gray * 255).astype(np.uint8)).save('static/uploaded.png')
+    return img_gray
 
 def apply_gaussian_filter(img, sigma):
     return gaussian_filter(img, sigma=sigma)
@@ -23,14 +23,22 @@ def fractional_derivative_rl(img, alpha, axis, kernel_size):
     kernel = kernel.reshape(1, -1) if axis == 0 else kernel.reshape(-1, 1)
     return convolve(img, kernel, mode='nearest')
 
+
 def caputo_fabrizio_derivative(img, alpha, axis):
-    h = 1
-    M = 1
-    f_forward = np.roll(img, -1, axis=axis)
-    f_backward = np.roll(img, 1, axis=axis)
-    term1 = (1 - alpha)/M * (f_forward - f_backward)
-    term2 = (3 * alpha * h)/(2 * M) * (f_forward - f_backward)
-    return term1 + term2
+    h = 1  
+    M = 1  
+
+    f_current = img
+    f_prev = np.roll(img, 1, axis=axis)
+
+    a1 = (1 - alpha) / M
+    a2 = (3 * alpha * h) / (2 * M)
+    a3 = (1 - alpha) / M
+    a4 = (alpha * h) / (2 * M)
+
+    return a1 * (np.roll(f_current, -1, axis=axis) - np.roll(f_current, 1, axis=axis)) + \
+           a2 * (np.roll(f_current, -1, axis=axis) - np.roll(f_prev, 1, axis=axis)) + \
+           a3 * (f_current - f_prev) + a4 * (np.roll(f_current, 1, axis=axis) - np.roll(f_prev, 2, axis=axis))
 
 def compute_gradients_rl(img, alpha, kernel_size):
     fx = fractional_derivative_rl(img, alpha, 0, kernel_size)
@@ -46,6 +54,7 @@ def non_maximal_suppression(G, theta):
     M, N = G.shape
     suppressed = np.zeros((M, N))
     angle = np.rad2deg(theta) % 180
+
     for i in range(1, M - 1):
         for j in range(1, N - 1):
             a = angle[i, j]
@@ -56,9 +65,11 @@ def non_maximal_suppression(G, theta):
                 q, r = G[i+1, j-1], G[i-1, j+1]
             elif 67.5 <= a < 112.5:
                 q, r = G[i+1, j], G[i-1, j]
-            elif 112.5 <= a < 157.5:
+            else:
                 q, r = G[i-1, j-1], G[i+1, j+1]
-            suppressed[i, j] = G[i, j] if G[i, j] >= q and G[i, j] >= r else 0
+
+            if G[i, j] >= q and G[i, j] >= r:
+                suppressed[i, j] = G[i, j]
     return suppressed
 
 def auto_threshold_percentile(G, low_p=30, high_p=97):
@@ -66,54 +77,50 @@ def auto_threshold_percentile(G, low_p=30, high_p=97):
     low = np.percentile(G, low_p)
     return max(min(low, high * 0.5), 0.001), min(high, 0.8)
 
-def hysteresis_thresholding(G, low_thresh, high_thresh):
+def hysteresis_thresholding(G, low, high):
     M, N = G.shape
-    result = np.zeros((M, N), dtype=np.uint8)
-    strong = G >= high_thresh
-    weak = (G >= low_thresh) & (G < high_thresh)
-    result[strong] = 255
+    out = np.zeros((M, N), dtype=np.uint8)
+    strong = G >= high
+    weak = (G >= low) & (G < high)
+    out[strong] = 255
     for i in range(1, M - 1):
         for j in range(1, N - 1):
             if weak[i, j] and np.any(strong[i-1:i+2, j-1:j+2]):
-                result[i, j] = 255
-    return result
+                out[i, j] = 255
+    return out
 
-def auto_select_parameters(img, kernel_options=[5, 7, 9, 11]):
+def auto_select_parameters(img_path, kernel_options=[5, 7, 9, 11]):
+    img = load_image(img_path)
     best_alpha, best_sigma, best_kernel, best_score = 0.5, 1.0, 5, -1
-    for kernel_size in kernel_options:
+    for k in kernel_options:
         for alpha in [0.3, 0.5, 0.7]:
             for sigma in [0.5, 1.0, 2.0]:
                 smoothed = apply_gaussian_filter(img, sigma)
-                G, _ = compute_gradients_rl(smoothed, alpha, kernel_size)
-                mean_g = np.mean(G)
-                std_g = np.std(G)
-                score = std_g / (mean_g + 1e-5)
+                G, _ = compute_gradients_rl(smoothed, alpha, k)
+                score = np.std(G) / (np.mean(G) + 1e-5)
                 if score > best_score:
-                    best_alpha, best_sigma, best_kernel, best_score = alpha, sigma, kernel_size, score
+                    best_alpha, best_sigma, best_kernel, best_score = alpha, sigma, k, score
     return best_alpha, best_sigma, best_kernel
 
-def run_edge_detection(path, alpha, sigma):
-    img = load_image(path)
-    best_alpha, best_sigma, kernel_size = auto_select_parameters(img)
 
+def run_edge_detection(img_path, alpha, sigma):
+    img = load_image(img_path)
+    _, _, kernel_size = auto_select_parameters(img_path)
     filtered = apply_gaussian_filter(img, sigma)
 
     G_rl, theta_rl = compute_gradients_rl(filtered, alpha, kernel_size)
     G_cf, theta_cf = compute_gradients_cf(filtered, alpha)
 
-    G_rl_supp = non_maximal_suppression(G_rl, theta_rl)
-    G_cf_supp = non_maximal_suppression(G_cf, theta_cf)
+    G_rl = non_maximal_suppression(G_rl, theta_rl)
+    G_cf = non_maximal_suppression(G_cf, theta_cf)
 
-    low_rl, high_rl = auto_threshold_percentile(G_rl_supp)
-    low_cf, high_cf = auto_threshold_percentile(G_cf_supp)
+    low_rl, high_rl = auto_threshold_percentile(G_rl)
+    low_cf, high_cf = auto_threshold_percentile(G_cf)
 
-    edges_rl = hysteresis_thresholding(G_rl_supp, low_rl, high_rl)
-    edges_cf = hysteresis_thresholding(G_cf_supp, low_cf, high_cf)
-
+    edges_rl = hysteresis_thresholding(G_rl, low_rl, high_rl)
+    edges_cf = hysteresis_thresholding(G_cf, low_cf, high_cf)
     edges_cv = cv2.Canny((filtered * 255).astype(np.uint8), 50, 150)
 
-    Image.fromarray(edges_rl).save("static/result_rl.png")
-    Image.fromarray(edges_cf).save("static/result_cf.png")
-    Image.fromarray(edges_cv).save("static/result_cv.png")
-
-    return best_alpha, best_sigma
+    Image.fromarray(edges_rl).save('static/result_rl.png')
+    Image.fromarray(edges_cf).save('static/result_cf.png')
+    Image.fromarray(edges_cv).save('static/result_cv.png')
