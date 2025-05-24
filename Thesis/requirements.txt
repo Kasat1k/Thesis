@@ -1,0 +1,6 @@
+flask
+numpy
+pillow
+scipy
+matplotlib
+opencv-python
